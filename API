@@ -1,0 +1,608 @@
+import json
+import os
+import threading
+import time
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+import paho.mqtt.client as mqtt
+import requests
+import pymysql
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+import numpy as np
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WEB_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MQTT_BROKER = ""
+MQTT_PORT = 
+MQTT_USER = ""
+MQTT_PASSWORD = ""
+MQTT_CA_CERT = os.path.join(ROOT_DIR, "emqxsl-ca.crt")
+MQTT_TOPIC = "raspberry/mqtt"
+
+MYSQL_HOST = ""
+MYSQL_USER = ""
+MYSQL_PASSWORD = ""
+MYSQL_DATABASE = ""
+MYSQL_PORT = 
+
+WEATHER_API_URL = "https://api.open-meteo.com/v1/forecast"
+
+CITIES = {
+    "Fukuoka": {"lat": 33.59, "lon": 130.40},
+    "Tokyo": {"lat": 35.68, "lon": 139.69},
+    "Osaka": {"lat": 34.69, "lon": 135.50},
+    "Nagoya": {"lat": 35.18, "lon": 136.90},
+    "Sapporo": {"lat": 43.06, "lon": 141.35},
+    "Sendai": {"lat": 38.26, "lon": 140.87},
+}
+
+DEFAULT_CITY = "Fukuoka"
+
+MODEL_PATH = os.environ.get("RAINNET_MODEL", "")
+SCALER_PATH = os.environ.get("RAINNET_SCALER", "")
+
+# -----------------------------------------------------------------------------
+# RainNet-MT Engine
+# -----------------------------------------------------------------------------
+
+if TORCH_AVAILABLE:
+    class MultiScaleAttention(nn.Module):
+        def __init__(self, hidden_size, num_heads=8):
+            super().__init__()
+            self.num_heads = num_heads
+            self.head_dim = hidden_size // num_heads
+            assert hidden_size % num_heads == 0
+
+            self.query = nn.Linear(hidden_size, hidden_size)
+            self.key = nn.Linear(hidden_size, hidden_size)
+            self.value = nn.Linear(hidden_size, hidden_size)
+            self.out = nn.Linear(hidden_size, hidden_size)
+            self.dropout = nn.Dropout(0.1)
+
+        def forward(self, x):
+            batch_size, seq_len, hidden_size = x.size()
+            q = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+            k = self.key(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+            v = self.value(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+            attention_scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.head_dim)
+            attention_weights = F.softmax(attention_scores, dim=-1)
+            attention_weights = self.dropout(attention_weights)
+
+            attention_output = torch.matmul(attention_weights, v)
+            attention_output = attention_output.transpose(1, 2).contiguous().view(
+                batch_size, seq_len, hidden_size
+            )
+            return self.out(attention_output)
+
+    class FeaturePyramidNetwork(nn.Module):
+        def __init__(self, input_size, hidden_size, dilation_rates=(1, 2, 4, 8), use_dilated=True):
+            super().__init__()
+            self.use_dilated = use_dilated
+            self.conv_blocks = nn.ModuleList()
+
+            if use_dilated:
+                configs = [(3, d) for d in dilation_rates]
+            else:
+                configs = [(k, 1) for k in (3, 5, 7)]
+
+            for kernel_size, dilation in configs:
+                padding = dilation * (kernel_size - 1) // 2
+                block = nn.Sequential(
+                    nn.Conv1d(input_size, hidden_size, kernel_size=kernel_size, padding=padding, dilation=dilation),
+                    nn.BatchNorm1d(hidden_size),
+                    nn.GELU(),
+                )
+                self.conv_blocks.append(block)
+
+            self.num_paths = len(self.conv_blocks)
+            self.fusion = nn.Conv1d(hidden_size * self.num_paths, hidden_size, kernel_size=1)
+            self.dropout = nn.Dropout(0.2)
+
+        def forward(self, x):
+            x = x.transpose(1, 2)
+            conv_features = [block(x) for block in self.conv_blocks]
+            fused = torch.cat(conv_features, dim=1)
+            fused = self.dropout(F.relu(self.fusion(fused)))
+            return fused.transpose(1, 2)
+
+    class RainNetMTEnhanced(nn.Module):
+        def __init__(
+            self,
+            input_size,
+            hidden_size=512,
+            num_layers=6,
+            num_classes=3,
+            dropout=0.15,
+            dilation_rates=(1, 2, 4, 8),
+            recurrent_type="gru",
+            use_bi_gru=False,
+            use_attention=False,
+            use_dilated_convs=True,
+            use_conditional_tasking=False,
+        ):
+            super().__init__()
+            self.num_classes = num_classes
+            self.hidden_size = hidden_size
+            self.use_attention = use_attention
+            self.use_conditional_tasking = use_conditional_tasking
+            self.recurrent_type = recurrent_type.lower()
+            self.use_bi_gru = use_bi_gru
+
+            self.input_norm = nn.LayerNorm(input_size)
+            self.fpn = FeaturePyramidNetwork(
+                input_size, hidden_size // 2, dilation_rates=dilation_rates, use_dilated=use_dilated_convs
+            )
+
+            rnn_cls = nn.GRU if self.recurrent_type == "gru" else nn.LSTM
+            self.rnn = rnn_cls(
+                hidden_size // 2,
+                hidden_size,
+                num_layers=num_layers,
+                dropout=dropout if num_layers > 1 else 0,
+                bidirectional=use_bi_gru,
+                batch_first=True,
+            )
+            self.sequence_dim = hidden_size * (2 if use_bi_gru else 1)
+            self.shared_dim = hidden_size // 2
+
+            if use_attention:
+                self.multi_scale_attention = MultiScaleAttention(self.sequence_dim, num_heads=16)
+                self.global_attention = nn.Sequential(
+                    nn.Linear(self.sequence_dim, self.sequence_dim // 2),
+                    nn.Tanh(),
+                    nn.Linear(self.sequence_dim // 2, 1),
+                )
+            else:
+                self.multi_scale_attention = nn.Identity()
+                self.global_attention = None
+
+            self.feature_extractor = nn.Sequential(
+                nn.Linear(self.sequence_dim, self.sequence_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.sequence_dim, self.sequence_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.sequence_dim // 2, self.shared_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+            self.residual = nn.Linear(self.sequence_dim, self.shared_dim)
+
+            self.occurrence_head = nn.Sequential(
+                nn.Linear(self.shared_dim, self.shared_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.shared_dim // 2, 1),
+            )
+
+            self.intensity_head = nn.Sequential(
+                nn.Linear(self.shared_dim if not use_conditional_tasking else self.shared_dim + 1, self.shared_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.shared_dim // 2, num_classes),
+            )
+
+        def forward(self, x):
+            x = self.input_norm(x)
+            x = self.fpn(x)
+            rnn_out, _ = self.rnn(x)
+
+            if self.use_attention:
+                rnn_out = self.multi_scale_attention(rnn_out)
+                attention_weights = F.softmax(self.global_attention(rnn_out), dim=1)
+                pooled = torch.sum(attention_weights * rnn_out, dim=1)
+            else:
+                pooled = torch.mean(rnn_out, dim=1)
+
+            shared = self.feature_extractor(pooled) + self.residual(pooled)
+            occ_logits = self.occurrence_head(shared).squeeze(-1)
+            if self.use_conditional_tasking:
+                occ_prob = torch.sigmoid(occ_logits).unsqueeze(-1)
+                intensity_input = torch.cat([shared, occ_prob], dim=1)
+            else:
+                intensity_input = shared
+            intensity_logits = self.intensity_head(intensity_input)
+
+            return {"occurrence": occ_logits, "intensity": intensity_logits}
+
+
+class RainNetMTEngine:
+    def __init__(self, model_path=None, scaler_path=None, input_size=None):
+        self.intensity_labels = ["No Rain", "Light Rain", "Medium Rain", "Heavy Rain"]
+        self.model = None
+        self.scaler = None
+        self.use_real_model = False
+        self.device = torch.device("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu") if TORCH_AVAILABLE else None
+        self.input_size = input_size
+
+        if model_path and TORCH_AVAILABLE:
+            try:
+                import pickle
+
+                if os.path.exists(model_path):
+                    model_kwargs = {
+                        "hidden_size": 512,
+                        "num_layers": 6,
+                        "dropout": 0.15,
+                        "dilation_rates": (1, 2, 4, 8),
+                        "recurrent_type": "gru",
+                        "use_bi_gru": False,
+                        "use_attention": False,
+                        "use_dilated_convs": True,
+                        "use_conditional_tasking": False,
+                    }
+
+                    if scaler_path and os.path.exists(scaler_path):
+                        try:
+                            with open(scaler_path, "rb") as f:
+                                self.scaler = pickle.load(f)
+                            if hasattr(self.scaler, "n_features_in_"):
+                                self.input_size = self.scaler.n_features_in_
+                            elif hasattr(self.scaler, "scale_"):
+                                self.input_size = len(self.scaler.scale_)
+                        except Exception:
+                            pass
+
+                    if self.input_size is None:
+                        self.input_size = 200
+
+                    self.model = RainNetMTEnhanced(input_size=self.input_size, **model_kwargs)
+                    self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+                    self.model.to(self.device)
+                    self.model.eval()
+                    self.use_real_model = True
+            except Exception:
+                self.use_real_model = False
+
+    def predict(self, current_data):
+        if self.use_real_model and self.model is not None:
+            try:
+                features = self._extract_features(current_data)
+                if features is not None and len(features) == self.input_size:
+                    if self.scaler is not None:
+                        features_scaled = self.scaler.transform([features])
+                    else:
+                        features_scaled = np.array([features])
+                    features_tensor = (
+                        torch.FloatTensor(features_scaled).reshape(1, self.input_size, 1).to(self.device)
+                    )
+                    with torch.no_grad():
+                        output = self.model(features_tensor)
+                        intensity_logits = output["intensity"]
+                        intensity_probs = F.softmax(intensity_logits, dim=1)
+                        intensity_idx = torch.argmax(intensity_probs, dim=1).item()
+                        rain_prob = (intensity_probs[0][1] + intensity_probs[0][2]).item() * 100
+
+                        if intensity_idx == 0:
+                            label = "No Rain"
+                        elif intensity_idx == 1:
+                            label = "Light Rain"
+                        elif intensity_idx == 2:
+                            label = "Medium Rain"
+                        else:
+                            label = "Heavy Rain"
+
+                        return {
+                            "probability": rain_prob,
+                            "intensity_index": intensity_idx,
+                            "intensity_label": label,
+                        }
+            except Exception:
+                pass
+
+        rh = float(current_data.get("Humidity", 0))
+        pressure = float(current_data.get("Pressure", 1013))
+        wind = float(current_data.get("Windspeed", 0))
+        temp = float(current_data.get("Ta", 25))
+
+        base_score = 0
+        if rh > 70:
+            base_score += (rh - 70) * 2.5
+        if rh > 85:
+            base_score += (rh - 85) * 3
+        if pressure < 1015:
+            base_score += (1015 - pressure) * 3.5
+        if pressure < 1000:
+            base_score += (1000 - pressure) * 5
+        if 3 < wind < 10:
+            base_score += wind * 1.5
+        elif wind > 10:
+            base_score += 15
+        if rh > 80 and temp > 20:
+            base_score += 10
+
+        prob = min(max(base_score / 1.5, 0), 100)
+
+        if prob < 50:
+            intensity_idx = 0
+        elif prob < 70:
+            intensity_idx = 1
+        elif prob < 85:
+            intensity_idx = 2
+        else:
+            intensity_idx = 3
+
+        return {
+            "probability": prob,
+            "intensity_index": intensity_idx,
+            "intensity_label": self.intensity_labels[intensity_idx],
+        }
+
+    def _extract_features(self, current_data):
+        try:
+            rh = float(current_data.get("Humidity", 0))
+            pressure = float(current_data.get("Pressure", 1013))
+            wind = float(current_data.get("Windspeed", 0))
+            temp = float(current_data.get("Ta", 25))
+            co2 = float(current_data.get("CO2", 400))
+            base_features = [rh, pressure, wind, temp, co2]
+            if self.input_size:
+                features = base_features * (self.input_size // len(base_features))
+                features += base_features[: self.input_size % len(base_features)]
+                return np.array(features[: self.input_size])
+            return None
+        except Exception:
+            return None
+
+
+# -----------------------------------------------------------------------------
+# State + MQTT
+# -----------------------------------------------------------------------------
+
+
+class AppState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.latest = {}
+        self.last_update = 0.0
+        self.history = []
+        self.prediction = {}
+        self.weather = {}
+        self.last_weather = 0.0
+        self.city = DEFAULT_CITY
+        self.mqtt_connected = False
+
+    def update_data(self, payload, prediction):
+        with self.lock:
+            self.latest = payload
+            self.last_update = time.time()
+            if prediction:
+                self.prediction = prediction
+                self.history.append(
+                    {"ts": self.last_update, "probability": prediction.get("probability", 0)}
+                )
+                self.history = self.history[-30:]
+
+
+STATE = AppState()
+ENGINE = RainNetMTEngine(
+    model_path=MODEL_PATH if MODEL_PATH and os.path.exists(MODEL_PATH) else None,
+    scaler_path=SCALER_PATH if SCALER_PATH and os.path.exists(SCALER_PATH) else None,
+)
+
+
+def mqtt_on_connect(client, userdata, flags, rc, properties=None):
+    STATE.mqtt_connected = rc == 0
+    if rc == 0:
+        client.subscribe(MQTT_TOPIC)
+
+
+def mqtt_on_disconnect(client, userdata, rc, properties=None):
+    STATE.mqtt_connected = False
+
+
+def mqtt_on_message(client, userdata, msg):
+    try:
+        payload = json.loads(msg.payload.decode("utf-8"))
+    except Exception:
+        return
+    prediction = ENGINE.predict(payload)
+    STATE.update_data(payload, prediction)
+
+
+def start_mqtt():
+    try:
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    except Exception:
+        client = mqtt.Client()
+    client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+    if os.path.exists(MQTT_CA_CERT):
+        client.tls_set(ca_certs=MQTT_CA_CERT)
+    client.on_connect = mqtt_on_connect
+    client.on_message = mqtt_on_message
+    client.on_disconnect = mqtt_on_disconnect
+    try:
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        client.loop_forever()
+    except Exception as exc:
+        print(f"MQTT connection error: {exc}")
+
+
+def fetch_weather(city_name):
+    coords = CITIES.get(city_name, CITIES[DEFAULT_CITY])
+    url = (
+        f"{WEATHER_API_URL}?latitude={coords['lat']}&longitude={coords['lon']}"
+        "&current_weather=true"
+    )
+    response = requests.get(url, timeout=5)
+    if response.status_code != 200:
+        return None
+    data = response.json().get("current_weather", {})
+    return {
+        "city": city_name,
+        "temperature": data.get("temperature", 0),
+        "weathercode": data.get("weathercode", 0),
+        "windspeed": data.get("windspeed", 0),
+    }
+
+
+def fetch_history(label_name):
+    col_map = {
+        "Humidity": "Humidity",
+        "Ta": "Indoor_Temperature",
+        "Pressure": "Pressure",
+        "Windspeed": "Wind_Speed",
+        "CO2": "co2",
+        "PM2.5": "pm25",
+        "PM10": "pm10",
+        "Tg": "Globe_temperature",
+        "MRT": "Mean_radiant_temperature",
+    }
+    db_col = col_map.get(label_name, "Indoor_Temperature")
+    connection = pymysql.connect(
+        host=MYSQL_HOST,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE,
+        port=MYSQL_PORT,
+    )
+    data = []
+    with connection.cursor() as cursor:
+        sql = (
+            f"SELECT Time, {db_col} FROM raspberry_mqtt5 "
+            "WHERE Time >= NOW() - INTERVAL 1 DAY ORDER BY Time"
+        )
+        cursor.execute(sql)
+        for row in cursor.fetchall():
+            data.append({"time": row[0].isoformat(), "value": row[1]})
+    connection.close()
+    return data
+
+
+# -----------------------------------------------------------------------------
+# HTTP server
+# -----------------------------------------------------------------------------
+
+
+def fetch_latest_snapshot():
+    col_map = {
+        "Humidity": "Humidity",
+        "Ta": "Indoor_Temperature",
+        "Pressure": "Pressure",
+        "Windspeed": "Wind_Speed",
+        "CO2": "co2",
+        "PM2.5": "pm25",
+        "PM10": "pm10",
+        "Tg": "Globe_temperature",
+    }
+    connection = pymysql.connect(
+        host=MYSQL_HOST,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE,
+        port=MYSQL_PORT,
+    )
+    latest = {}
+    with connection.cursor() as cursor:
+        select_cols = ["Time"] + [col_map[key] for key in col_map]
+        sql = f"SELECT {', '.join(select_cols)} FROM raspberry_mqtt5 ORDER BY Time DESC LIMIT 1"
+        cursor.execute(sql)
+        row = cursor.fetchone()
+        if row:
+            for idx, key in enumerate(select_cols):
+                if key == "Time":
+                    continue
+                for logical_key, db_col in col_map.items():
+                    if db_col == key:
+                        latest[logical_key] = row[idx]
+                        break
+    connection.close()
+    return latest
+
+
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=WEB_DIR, **kwargs)
+
+    def _send_json(self, payload, status=200):
+        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/state":
+            now = time.time()
+            params = parse_qs(parsed.query)
+            city = params.get("city", [DEFAULT_CITY])[0]
+            if city in CITIES:
+                STATE.city = city
+            with STATE.lock:
+                if not STATE.latest or (now - STATE.last_update) > 10:
+                    try:
+                        latest = fetch_latest_snapshot()
+                        if latest:
+                            prediction = ENGINE.predict(latest)
+                            STATE.latest = latest
+                            STATE.prediction = prediction
+                            STATE.last_update = now
+                            if prediction:
+                                STATE.history.append(
+                                    {"ts": STATE.last_update, "probability": prediction.get("probability", 0)}
+                                )
+                                STATE.history = STATE.history[-30:]
+                    except Exception as exc:
+                        print(f"DB fallback error: {exc}")
+                if now - STATE.last_weather > 1800 or not STATE.weather:
+                    try:
+                        weather = fetch_weather(STATE.city)
+                        if weather:
+                            STATE.weather = weather
+                            STATE.last_weather = now
+                    except Exception:
+                        pass
+                data = {
+                    "city": STATE.city,
+                    "latest": STATE.latest,
+                    "last_update": STATE.last_update,
+                    "history": STATE.history,
+                    "prediction": STATE.prediction,
+                    "weather": STATE.weather,
+                    "mqtt_connected": STATE.mqtt_connected,
+                }
+            self._send_json(data)
+            return
+
+        if parsed.path == "/api/history":
+            params = parse_qs(parsed.query)
+            label = params.get("label", ["Ta"])[0]
+            try:
+                data = fetch_history(label)
+                self._send_json({"label": label, "data": data})
+            except Exception as exc:
+                self._send_json({"label": label, "error": str(exc), "data": []}, status=500)
+            return
+
+        super().do_GET()
+
+
+def main():
+    mqtt_thread = threading.Thread(target=start_mqtt, daemon=True)
+    mqtt_thread.start()
+
+    server = ThreadingHTTPServer(("0.0.0.0", 8000), Handler)
+    print("RainNet-MT web server running at http://localhost:8000/")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
