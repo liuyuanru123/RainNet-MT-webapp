@@ -1,0 +1,112 @@
+wo<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RainNet-MT Web</title>
+    <link rel="icon" href="favicon.ico" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="bg-shapes" aria-hidden="true"></div>
+    <main class="app">
+      <header class="app-header reveal">
+        <div class="title-block">
+          <div class="app-title">RainNet-MT</div>
+          <div class="app-subtitle" id="locationTime">Fukuoka - --:--</div>
+        </div>
+        <div class="header-actions">
+          <button class="btn btn-analytics" id="analyticsBtn">Analytics</button>
+          <button class="btn btn-report" id="reportBtn">Report</button>
+          <button class="btn btn-ghost" id="settingsBtn" aria-label="Settings">Settings</button>
+        </div>
+      </header>
+
+      <section class="card weather-card reveal" id="weatherCard" role="button" tabindex="0">
+        <div class="weather-left">
+          <div class="weather-title">Local Weather</div>
+          <div class="weather-city" id="weatherCity">Fukuoka</div>
+          <div class="weather-detail" id="weatherDetail">Wind 0.0 m/s - Clear</div>
+        </div>
+        <div class="weather-right">
+          <div class="weather-temp" id="weatherTemp">-- C</div>
+          <div class="weather-icon" id="weatherIcon">SUN</div>
+        </div>
+      </section>
+
+      <section class="sensor-grid reveal" id="sensorGrid">
+        <article class="card sensor-card accent-blue" data-key="Ta">
+          <div class="sensor-title">Temperature</div>
+          <div class="sensor-value" id="TaValue">--</div>
+          <div class="sensor-unit">C</div>
+        </article>
+        <article class="card sensor-card accent-blue" data-key="Humidity">
+          <div class="sensor-title">Humidity</div>
+          <div class="sensor-value" id="HumidityValue">--</div>
+          <div class="sensor-unit">%</div>
+        </article>
+        <article class="card sensor-card accent-blue" data-key="Tg">
+          <div class="sensor-title">Globe Temp</div>
+          <div class="sensor-value" id="TgValue">--</div>
+          <div class="sensor-unit">C</div>
+        </article>
+        <article class="card sensor-card accent-green" data-key="Pressure">
+          <div class="sensor-title">Pressure</div>
+          <div class="sensor-value" id="PressureValue">--</div>
+          <div class="sensor-unit">hPa</div>
+        </article>
+        <article class="card sensor-card accent-green" data-key="Windspeed">
+          <div class="sensor-title">Wind Speed</div>
+          <div class="sensor-value" id="WindspeedValue">--</div>
+          <div class="sensor-unit">m/s</div>
+        </article>
+        <article class="card sensor-card accent-orange" data-key="CO2">
+          <div class="sensor-title">CO2</div>
+          <div class="sensor-value" id="CO2Value">--</div>
+          <div class="sensor-unit">ppm</div>
+        </article>
+        <article class="card sensor-card accent-orange" data-key="PM2.5">
+          <div class="sensor-title">PM2.5</div>
+          <div class="sensor-value" id="PM2.5Value">--</div>
+          <div class="sensor-unit">ug/m3</div>
+        </article>
+        <article class="card sensor-card accent-orange" data-key="PM10">
+          <div class="sensor-title">PM10</div>
+          <div class="sensor-value" id="PM10Value">--</div>
+          <div class="sensor-unit">ug/m3</div>
+        </article>
+      </section>
+
+      <section class="card prediction-card reveal">
+        <div class="prediction-header">
+          <div class="prediction-title">Rainfall Prediction (1h)</div>
+          <div class="status-pill" id="statusPill">Monitoring</div>
+        </div>
+        <div class="prediction-intensity" id="intensityLabel">Analyzing data...</div>
+        <div class="progress-track">
+          <div class="progress-fill" id="probFill" style="width: 0%"></div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="trendChart" width="900" height="220"></canvas>
+          <div class="chart-caption">Recent Updates - Probability (%)</div>
+        </div>
+      </section>
+    </main>
+
+    <div class="modal" id="modal" aria-hidden="true">
+      <div class="modal-backdrop" id="modalBackdrop"></div>
+      <div class="modal-card" role="dialog" aria-modal="true">
+        <div class="modal-header">
+          <div class="modal-title" id="modalTitle">Panel</div>
+          <button class="btn btn-ghost" id="modalClose" aria-label="Close">X</button>
+        </div>
+        <div class="modal-body" id="modalBody"></div>
+        <div class="modal-footer">
+          <button class="btn btn-analytics" id="modalPrimary">OK</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
