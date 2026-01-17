@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Welcome to RainNet-MT</title>
+    <link rel="icon" href="favicon.ico" />
+    <link rel="stylesheet" href="login.css" />
+  </head>
+  <body>
+    <div class="login-shell">
+      <div class="login-card">
+        <div class="login-logo">
+          <img src="AppIcon.png" alt="RainNet-MT" />
+        </div>
+        <div class="login-title">RainNet-MT</div>
+        <div class="login-subtitle">Rainfall Monitoring System</div>
+        <div class="login-version">Version 2.0</div>
+        <form id="loginForm">
+          <label class="field">
+            <span>Select City</span>
+            <select name="city" required>
+              <option value="Fukuoka">Fukuoka</option>
+              <option value="Tokyo">Tokyo</option>
+              <option value="Osaka">Osaka</option>
+              <option value="Nagoya">Nagoya</option>
+              <option value="Sapporo">Sapporo</option>
+              <option value="Sendai">Sendai</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Your Name (Optional)</span>
+            <input type="text" name="username" autocomplete="username" placeholder="Enter your name" />
+          </label>
+          <button class="btn" type="submit">Start Monitoring</button>
+          <button class="btn btn-secondary" type="button" id="guestBtn">Continue as Guest</button>
+          <div class="hint" id="loginHint"></div>
+        </form>
+      </div>
+    </div>
+    <script src="login.js"></script>
+  </body>
+</html>
